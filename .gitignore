@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Data
+# Deployed on Streamlit Community Cloud, which serves only what's in the git
+# repo - raw + processed data must be committed or the app has nothing to
+# read at runtime. Sizes are small (train.csv ~17MB, xlsx ~0.7MB), well
+# under GitHub's 100MB/file limit.
+
+# Logs
+logs/*.log
+logs/*.jsonl
+!logs/.gitkeep
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Env
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/*
+!.vscode/settings.json

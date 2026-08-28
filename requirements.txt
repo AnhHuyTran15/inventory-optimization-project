@@ -1,0 +1,31 @@
+# Core data / numerical
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+openpyxl>=3.1          # read .xlsx
+
+# Notebooks
+jupyter>=1.0
+nbformat>=5.9
+ipykernel>=6.25
+
+# Layer B correlation / stats already covered by numpy+scipy
+
+# Layer C routing (optional, only needed once you implement the VRP solver)
+ortools>=9.7
+
+# App + deploy
+streamlit>=1.28
+matplotlib>=3.7
+plotly>=5.17
+folium>=0.16
+
+# Future: DB layer (Postgres), only needed once you move past CSV storage
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# Testing
+pytest>=7.4
+
+# Logging (stdlib logging is used; python-dotenv optional for config)
+python-dotenv>=1.0
