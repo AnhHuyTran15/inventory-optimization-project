@@ -12,6 +12,7 @@ The source data has sales, not inventory balances, so the snapshot is seeded per
 (store, SKU) and only used to drive the gauge and the double-order guard.
 """
 
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -406,6 +407,7 @@ def compute_executive_snapshot() -> dict:
     n_stores = None
     cost = None
     dist = None
+    co2 = None
     policies = load_layer_a_policies()
     _, max_d = sales_date_bounds()
     if policies is not None and max_d is not None:
@@ -423,13 +425,95 @@ def compute_executive_snapshot() -> dict:
                     if result is not None:
                         cost = float(result["total_cost"])
                         dist = float(result["total_distance_km"])
+                        co2 = float(result["total_co2_kg"])
     return {
         "n_stores_below_rop": n_stores,
         "pooled_pct": pooled_pct,
         "pooled_dollars": pooled_dollars,
         "route_cost": cost,
         "route_km": dist,
+        "route_co2_kg": co2,
     }
+
+
+_STOCKOUT_KEYWORDS = ["stockout", "risk", "đứt hàng", "dut hang", "hết hàng", "het hang",
+                      "below rop", "duoi rop", "dưới rop", "reorder"]
+_TOMORROW_KEYWORDS = ["tomorrow", "ngày mai", "ngay mai"]
+_SAVINGS_KEYWORDS = ["saving", "saved", "tiết kiệm", "tiet kiem", "pooled", "pooling"]
+_COST_KEYWORDS = ["transport cost", "routing cost", "shipping cost", "delivery cost",
+                  "chi phí vận chuyển", "chi phi van chuyen"]
+_CO2_KEYWORDS = ["co2", "carbon", "emission", "khí thải", "khi thai"]
+
+
+def answer_copilot_question(question: str, policies: pd.DataFrame | None,
+                            inputs: pd.DataFrame | None) -> str:
+    """Rule-based Q&A over this app's own precomputed data - keyword
+    matching, not a real language model (no API key configured for this
+    deployment). Answers a fixed set of supply-chain questions grounded in
+    real numbers; anything else gets an honest "can't answer that" rather
+    than a guess, since a wrong-but-confident number is worse than none."""
+    q = question.lower().strip()
+    if not q:
+        return "Ask a question — try one of the examples below."
+
+    if any(k in q for k in _STOCKOUT_KEYWORDS):
+        if policies is None or inputs is None:
+            return "Policy or model-input data isn't loaded, so I can't answer that."
+        _, max_d = sales_date_bounds()
+        if max_d is None:
+            return "Sales history isn't loaded, so I can't answer that."
+        today = pd.Timestamp(max_d)
+        today_inv = infer_on_hand_from_sales(today.strftime("%Y-%m-%d"))
+        if today_inv is None:
+            return "Could not walk on-hand from sales history to answer that."
+
+        use_tomorrow = any(k in q for k in _TOMORROW_KEYWORDS)
+        if use_tomorrow:
+            inv = project_tomorrow_on_hand(today_inv, policies, inputs)
+            day_label = "tomorrow (projected)"
+        else:
+            inv = today_inv
+            day_label = f"today ({_fmt_batch_date(today)})"
+
+        req = build_delivery_requests(policies, inv, today)
+        item_nums = re.findall(r"\d+", q)
+        item_id = int(item_nums[0]) if item_nums else None
+        if item_id is not None:
+            req = req[req["item"] == item_id]
+            subject = f"item {item_id}"
+        else:
+            subject = "any SKU"
+
+        stores_at_risk = sorted(req["store"].unique().tolist())
+        if not stores_at_risk:
+            return f"No stores are at or below reorder point for {subject}, {day_label}."
+        stores_str = ", ".join(f"Store {s}" for s in stores_at_risk)
+        return f"{stores_str} — at or below reorder point for {subject}, {day_label}."
+
+    if any(k in q for k in _SAVINGS_KEYWORDS):
+        snap = compute_executive_snapshot()
+        if snap["pooled_pct"] is None:
+            return "Pooling results aren't loaded, so I can't answer that."
+        dollars = f" (~${snap['pooled_dollars']:,.0f}/yr)" if snap["pooled_dollars"] is not None else ""
+        return f"Pooling safety stock at the DC saves {snap['pooled_pct']:.1f}% on average across all SKUs{dollars}."
+
+    if any(k in q for k in _CO2_KEYWORDS):
+        snap = compute_executive_snapshot()
+        if snap["route_co2_kg"] is None:
+            return "No dispatch route has been solved for today, so I can't answer that."
+        return f"Today's dispatch is estimated at {snap['route_co2_kg']:,.0f} kg CO2 across {snap['route_km']:.0f} km."
+
+    if any(k in q for k in _COST_KEYWORDS):
+        snap = compute_executive_snapshot()
+        if snap["route_cost"] is None:
+            return "No dispatch route has been solved for today, so I can't answer that."
+        return f"Today's dispatch route costs ${snap['route_cost']:,.0f} across {snap['route_km']:.0f} km."
+
+    return (
+        "I can only answer a few question types right now (keyword-matched, not a "
+        "real language model): stockout risk by SKU/store, pooled savings, today's "
+        "routing cost, and CO2 emissions. Try rephrasing toward one of those."
+    )
 
 
 def _store_id_from_stop(label: str) -> int | None:
@@ -849,6 +933,22 @@ with st.sidebar:
             "**Dispatch Routes** — today's delivery routes for stores below reorder "
             "point, solved as a capacitated VRP with ETAs."
         )
+
+    st.markdown("##### Supply Chain Copilot")
+    st.caption(
+        "Keyword-matched Q&A over this app's own data — not a live language "
+        "model (no API key configured for this deployment)."
+    )
+    st.caption(
+        'Try: "Which stores risk a stockout on item 12 tomorrow?" · '
+        '"How much are we saving from pooling?" · "What\'s today\'s routing cost?"'
+    )
+    copilot_q = st.text_input(
+        "Ask a question", key="copilot_q", label_visibility="collapsed",
+        placeholder="Ask about stockouts, savings, cost, CO2…",
+    )
+    if copilot_q:
+        st.info(answer_copilot_question(copilot_q, policies_precomputed, model_inputs))
 
 st.title("Inventory Control")
 st.caption("10 stores × 50 SKUs · (s, S) replenishment, risk pooling, and capacitated dispatch")
