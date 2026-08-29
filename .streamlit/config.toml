@@ -1,0 +1,6 @@
+# Defensive UX: an uncaught exception anywhere in app.py otherwise renders a
+# raw Python traceback in the page. Targeted try/except + st.error() around
+# the known risky spots (Excel/CSV parsing, OR-Tools solve) covers the cases
+# we anticipated; this is the fallback for the ones we didn't.
+[client]
+showErrorDetails = false

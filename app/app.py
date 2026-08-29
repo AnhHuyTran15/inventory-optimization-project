@@ -22,17 +22,29 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from scipy.stats import norm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.layer_a_dp import solve_for_row  # noqa: E402
+from src.layer_b_pooling import (  # noqa: E402
+    compute_correlation_matrix,
+    decentralized_safety_stock,
+    pooled_safety_stock,
+)
 from src.layer_c_routing import (  # noqa: E402
+    AVG_TRUCK_SPEED_KMH,
+    DEPOT_DEPARTURE_HOUR,
     KG_PER_UNIT,
     LOGISTICS_PATH,
+    STOP_SERVICE_MINUTES,
     build_delivery_requests,
     build_vrp_model,
     get_store_coordinates,
     parse_vehicle_capacity_tonnes,
 )
+from src.logging_config import get_logger  # noqa: E402
+
+logger = get_logger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "processed"
@@ -89,14 +101,19 @@ st.markdown(
         --shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.04);
       }
       html, body, [class*="css"] { color: var(--ink); }
-      h1 { font-size: 1.75rem !important; font-weight: 650 !important;
+      /* Type scale: page title 35-50px desktop / 28-40px mobile, body 14-20px
+         (interaction-heavy dashboard), captions 2px under body. */
+      h1 { font-size: 2.5rem !important; font-weight: 650 !important;
            letter-spacing: -0.02em; color: var(--ink) !important; }
       h2, .stMarkdown h2 { font-size: 1.15rem !important; font-weight: 650 !important;
            color: var(--ink) !important; margin-bottom: var(--space-3) !important; }
       h3, h4, .stMarkdown h3, .stMarkdown h4 {
            font-size: 1rem !important; font-weight: 600 !important;
            color: #334155 !important; }
-      .stCaption, [data-testid="stCaptionContainer"] { font-size: 13px !important; color: var(--muted) !important; }
+      .stCaption, [data-testid="stCaptionContainer"] { font-size: 14px !important; color: var(--muted) !important; }
+      @media (max-width: 640px) {
+        h1 { font-size: 1.9rem !important; }
+      }
       .stButton > button { border-radius: var(--radius) !important; box-shadow: var(--shadow); }
       .stButton > button[kind="primary"] {
         background: var(--accent) !important; border: none !important; color: #fff !important;
@@ -106,6 +123,9 @@ st.markdown(
         padding: var(--space-3) var(--space-4);
       }
       div[data-testid="stMetric"] label { font-size: 13px !important; color: var(--muted) !important; }
+      /* delta ("↑ 13787 km") defaults to a very light gray with delta_color="off" - too faint */
+      div[data-testid="stMetricDelta"] { color: #334155 !important; }
+      div[data-testid="stMetricDelta"] svg { fill: #334155 !important; }
       div[data-testid="stVerticalBlockBorderWrapper"] {
         border: none !important; border-radius: var(--radius) !important;
         box-shadow: var(--shadow) !important; background: var(--paper);
@@ -184,42 +204,72 @@ def empty_state(title: str, body: str) -> None:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+def _safe_read_csv(path: Path, **kwargs) -> pd.DataFrame | None:
+    """A missing file is normal (empty_state() handles it); a *present but
+    corrupt/malformed* file would otherwise raise mid-script and dump a raw
+    traceback into the page. Log it and degrade the same way as missing."""
+    if not path.exists():
+        return None
+    try:
+        return pd.read_csv(path, **kwargs)
+    except Exception:
+        logger.exception("Failed to read %s", path)
+        return None
+
+
 @st.cache_data
 def load_model_inputs():
-    path = DATA_DIR / "model_inputs.csv"
-    return pd.read_csv(path) if path.exists() else None
+    return _safe_read_csv(DATA_DIR / "model_inputs.csv")
 
 
 @st.cache_data
 def load_layer_a_policies():
-    path = DATA_DIR / "layer_a_policies.csv"
-    return pd.read_csv(path) if path.exists() else None
+    return _safe_read_csv(DATA_DIR / "layer_a_policies.csv")
 
 
 @st.cache_data
 def load_layer_b_pooling():
-    path = DATA_DIR / "layer_b_pooling_results.csv"
-    return pd.read_csv(path) if path.exists() else None
+    return _safe_read_csv(DATA_DIR / "layer_b_pooling_results.csv")
 
 
 @st.cache_data
 def load_recent_demand_by_store(item_id: int, n_days: int = 30):
-    path = RAW_DIR / "train.csv"
-    if not path.exists():
+    df = _safe_read_csv(RAW_DIR / "train.csv", parse_dates=["date"])
+    if df is None:
         return None
-    df = pd.read_csv(path, parse_dates=["date"])
-    sub = df[df["item"] == item_id]
-    cutoff = sub["date"].max() - pd.Timedelta(days=n_days - 1)
-    recent = sub[sub["date"] >= cutoff]
-    return recent.pivot(index="date", columns="store", values="sales")
+    try:
+        sub = df[df["item"] == item_id]
+        cutoff = sub["date"].max() - pd.Timedelta(days=n_days - 1)
+        recent = sub[sub["date"] >= cutoff]
+        return recent.pivot(index="date", columns="store", values="sales")
+    except Exception:
+        logger.exception("Failed to pivot demand history for item %s", item_id)
+        return None
+
+
+@st.cache_data
+def load_pooling_static_inputs(item_id: int):
+    """Sigmas, lead time, and cross-store correlation for one item - the
+    service-level-independent pieces of Layer B's formula. Cached separately
+    from the z-score math so the what-if slider recomputes cheaply without
+    re-reading train.csv on every drag."""
+    inputs = load_model_inputs()
+    if inputs is None:
+        return None
+    item_rows = inputs[inputs["item"] == item_id].sort_values("store")
+    if item_rows.empty:
+        return None
+    sigmas = item_rows["demand_std"].to_numpy()
+    lead_time = float(item_rows["lead_time_mean_days"].mean())
+    stores = item_rows["store"].to_numpy()
+    corr_df = compute_correlation_matrix(item_id)
+    corr_matrix = np.nan_to_num(corr_df.loc[stores, stores].to_numpy(), nan=0.0)
+    return sigmas, lead_time, corr_matrix
 
 
 @st.cache_data
 def load_daily_sales():
-    path = RAW_DIR / "train.csv"
-    if not path.exists():
-        return None
-    return pd.read_csv(path, parse_dates=["date"])
+    return _safe_read_csv(RAW_DIR / "train.csv", parse_dates=["date"])
 
 
 @st.cache_data
@@ -277,35 +327,57 @@ def load_store_geo() -> pd.DataFrame | None:
     """10 real destination GPS points, assigned to store 1-10 (seed 42)."""
     if not LOGISTICS_PATH.exists():
         return None
-    pool = get_store_coordinates()
-    picked = pool.sample(n=10, random_state=42).reset_index(drop=True)
-    picked.insert(0, "store", range(1, 11))
-    return picked
+    try:
+        pool = get_store_coordinates()
+        picked = pool.sample(n=10, random_state=42).reset_index(drop=True)
+        picked.insert(0, "store", range(1, 11))
+        return picked
+    except Exception:
+        logger.exception("Failed to read store coordinates from %s", LOGISTICS_PATH)
+        return None
 
 
 @st.cache_data
 def load_depot_and_fleet():
     if not LOGISTICS_PATH.exists():
         return None
-    df = pd.read_excel(LOGISTICS_PATH, sheet_name="Primary Data")
-    origin = df[["Origin Location", "Origin Location Latitude", "Origin Location Longitude"]].dropna()
-    row = origin.iloc[0]
-    depot = (float(row["Origin Location Latitude"]), float(row["Origin Location Longitude"]))
-    depot_name = str(row["Origin Location"])
-    parsed = [parse_vehicle_capacity_tonnes(vt) for vt in df["Vehicle Type"].dropna()]
-    capacities = [k for k, _ in Counter(c for c in parsed if c).most_common(6)]
-    return depot, depot_name, capacities
+    try:
+        df = pd.read_excel(LOGISTICS_PATH, sheet_name="Primary Data")
+        origin = df[["Origin Location", "Origin Location Latitude", "Origin Location Longitude"]].dropna()
+        row = origin.iloc[0]
+        depot = (float(row["Origin Location Latitude"]), float(row["Origin Location Longitude"]))
+        depot_name = str(row["Origin Location"])
+        parsed = [parse_vehicle_capacity_tonnes(vt) for vt in df["Vehicle Type"].dropna()]
+        capacities = [k for k, _ in Counter(c for c in parsed if c).most_common(6)]
+        return depot, depot_name, capacities
+    except Exception:
+        logger.exception("Failed to read depot/fleet from %s", LOGISTICS_PATH)
+        return None
 
 
 @st.cache_data
 def cached_vrp(requests: pd.DataFrame, store_geo: pd.DataFrame, depot: tuple,
                fleet: list, time_limit_seconds: int = 5):
-    return build_vrp_model(
-        requests, store_geo, depot, fleet, time_limit_seconds=time_limit_seconds
-    )
+    try:
+        return build_vrp_model(
+            requests, store_geo, depot, fleet, time_limit_seconds=time_limit_seconds
+        )
+    except Exception:
+        logger.exception("VRP solve failed for %d requests", len(requests))
+        return None
 
 
 EXEC_SNAPSHOT_VRP_TIME_LIMIT = 2  # short budget: this runs on every page load, before any tab is opened
+
+
+def pooling_annual_dollar_savings(pooling_df: pd.DataFrame, unit_cost: float, holding_rate: float) -> pd.Series:
+    """Annual holding-cost saved per SKU from pooling safety stock at the DC
+    instead of every store buffering alone: units of safety stock saved x
+    unit cost x annual holding-cost rate. Same unit_cost/holding_rate for
+    every row (COST_ASSUMPTIONS in data_prep.py), so a placeholder $ figure -
+    directionally right, not a real per-unit cost.
+    """
+    return (pooling_df["ss_decentralized"] - pooling_df["ss_pooled"]) * unit_cost * holding_rate
 
 
 @st.cache_data
@@ -317,11 +389,19 @@ def compute_executive_snapshot() -> dict:
     Tab 3 re-solves with a longer budget when actually opened.
     """
     pooling = load_layer_b_pooling()
+    inputs = load_model_inputs()
     pooled_pct = (
         float(pooling["pct_savings"].mean())
         if pooling is not None and len(pooling)
         else None
     )
+    pooled_dollars = None
+    if pooling is not None and len(pooling) and inputs is not None and len(inputs):
+        unit_cost = float(inputs["unit_cost_placeholder"].iloc[0])
+        holding_rate = float(inputs["holding_cost_rate_annual"].iloc[0])
+        pooled_dollars = float(
+            pooling_annual_dollar_savings(pooling, unit_cost, holding_rate).sum()
+        )
     n_stores = None
     cost = None
     dist = None
@@ -339,11 +419,13 @@ def compute_executive_snapshot() -> dict:
                 if geo is not None and fleet_info is not None:
                     depot, _, fleet = fleet_info
                     result = cached_vrp(req, geo, depot, fleet, EXEC_SNAPSHOT_VRP_TIME_LIMIT)
-                    cost = float(result["total_cost"])
-                    dist = float(result["total_distance_km"])
+                    if result is not None:
+                        cost = float(result["total_cost"])
+                        dist = float(result["total_distance_km"])
     return {
         "n_stores_below_rop": n_stores,
         "pooled_pct": pooled_pct,
+        "pooled_dollars": pooled_dollars,
         "route_cost": cost,
         "route_km": dist,
     }
@@ -361,6 +443,14 @@ def _store_id_from_stop(label: str) -> int | None:
 
 def _fmt_batch_date(d) -> str:
     return pd.Timestamp(d).strftime("%b %d, %Y")
+
+
+def _format_eta(minutes_from_depart: float) -> str:
+    """Clock time, assuming trucks roll out at DEPOT_DEPARTURE_HOUR (see
+    layer_c_routing.py for why this is a documented assumption, not measured data)."""
+    base = pd.Timestamp("2000-01-01") + pd.Timedelta(hours=DEPOT_DEPARTURE_HOUR)
+    eta = base + pd.Timedelta(minutes=round(float(minutes_from_depart)))
+    return eta.strftime("%I:%M %p").lstrip("0")
 
 
 def project_tomorrow_on_hand(today_inv: pd.DataFrame, policies: pd.DataFrame,
@@ -520,12 +610,12 @@ def stop_timeline_html(route: dict, store_geo: pd.DataFrame, depot_name: str,
     for i, row in enumerate(rows.itertuples()):
         is_depot = str(row.stop) == "depot"
         if is_depot:
-            bg, icon = "#dbe9ff", _WAREHOUSE_SVG
+            bg, icon = "#93c5fd", _WAREHOUSE_SVG
             title = "Return to depot" if i == n - 1 and n > 1 else "Depot"
             meta = depot_name
             drop = ""
         else:
-            bg, icon = "#c6ede2", _STORE_SVG
+            bg, icon = "#5eead4", _STORE_SVG
             sid = _store_id_from_stop(row.stop)
             loc = geo.loc[sid, "location_name"] if sid in geo.index else row.stop
             extra = f" {str(row.stop)[str(row.stop).find('('):]}" if "(" in str(row.stop) else ""
@@ -542,6 +632,7 @@ def stop_timeline_html(route: dict, store_geo: pd.DataFrame, depot_name: str,
             '<div style="width:2px;flex:1;min-height:18px;background:#e2e8f0;"></div>'
             if i < n - 1 else ""
         )
+        eta_str = _format_eta(row.eta_minutes)
         parts.append(
             f'<div style="display:flex;gap:12px;align-items:flex-start;">'
             f'<div style="width:28px;display:flex;flex-direction:column;'
@@ -550,12 +641,39 @@ def stop_timeline_html(route: dict, store_geo: pd.DataFrame, depot_name: str,
             f'display:flex;align-items:center;justify-content:center;flex-shrink:0;">'
             f'{icon}</div>{line}</div>'
             f'<div style="padding-bottom:14px;">'
+            f'<div style="display:flex;align-items:baseline;gap:8px;">'
             f'<div style="font-weight:650;font-size:14px;color:#0f172a;">{title}</div>'
+            f'<div style="font-size:12px;font-weight:600;color:#334155;">ETA {eta_str}</div>'
+            f'</div>'
             f'<div style="font-size:12px;color:#64748b;">{meta}</div>{drop}'
             f'</div></div>'
         )
     parts.append("</div>")
     return "".join(parts)
+
+
+def build_driver_manifest(stops_df: pd.DataFrame, store_geo: pd.DataFrame) -> pd.DataFrame:
+    """Flatten the VRP stop sequence into a print/CSV sheet a driver can follow."""
+    geo = store_geo.set_index("store")
+    rows = []
+    for r in stops_df.itertuples():
+        sid = _store_id_from_stop(r.stop)
+        if sid is None:
+            location = "—"
+        elif sid in geo.index:
+            location = geo.loc[sid, "location_name"]
+        else:
+            location = ""
+        rows.append({
+            "truck": r.vehicle,
+            "stop_seq": r.seq,
+            "stop": r.stop,
+            "location": location,
+            "units_to_deliver": int(round(r.demand_kg / KG_PER_UNIT)),
+            "cumulative_load_kg": r.cumul_load_kg,
+            "eta": _format_eta(r.eta_minutes),
+        })
+    return pd.DataFrame(rows)
 
 
 def erp_inventory_snapshot(store, item, s, S, demand_mean, demand_std):
@@ -583,28 +701,69 @@ def erp_inventory_snapshot(store, item, s, S, demand_mean, demand_std):
     return on_hand, in_transit
 
 
-def sparkline_fig(values, color: str, *, smooth: bool = False, height: int = 96):
-    """Compact demand sparkline that fills the card; axes hidden."""
+def build_store_po(store: int, model_inputs_df: pd.DataFrame, policies_df: pd.DataFrame) -> pd.DataFrame:
+    """Every SKU at this store below ROP with no PO already in transit - the
+    same simulated ERP snapshot the tank gauge uses, reused so the export
+    matches what tab 1 shows on screen."""
+    rows = []
+    for _, row in model_inputs_df[model_inputs_df["store"] == store].iterrows():
+        pol = policies_df[(policies_df["store"] == store) & (policies_df["item"] == row["item"])]
+        if pol.empty:
+            continue
+        pol = pol.iloc[0]
+        s_i, S_i = max(int(pol["s"]), 0), max(int(pol["S"]), 1)
+        on_hand, in_transit = erp_inventory_snapshot(
+            store, row["item"], s_i, S_i, row["demand_mean"], row["demand_std"]
+        )
+        if on_hand <= s_i and in_transit == 0:
+            rows.append({
+                "store": store, "item": int(row["item"]), "on_hand": on_hand,
+                "reorder_point_s": s_i, "order_up_to_S": S_i, "order_qty": S_i - on_hand,
+            })
+    return pd.DataFrame(rows, columns=[
+        "store", "item", "on_hand", "reorder_point_s", "order_up_to_S", "order_qty"
+    ])
+
+
+def sparkline_fig(values, color: str, *, smooth: bool = False, height: int = 96, dates=None):
+    """Compact demand sparkline that fills the card; axes hidden but hover +
+    min/max end-labels give a reader the actual numbers behind the shape."""
     y = np.asarray(values, dtype=float)
     if smooth and len(y) >= 5:
         y = pd.Series(y).rolling(5, min_periods=1, center=True).mean().to_numpy()
+    x = pd.to_datetime(dates) if dates is not None else np.arange(len(y))
+    hovertemplate = (
+        "%{x|%b %d}: %{y:.0f} units<extra></extra>"
+        if dates is not None
+        else "%{y:.0f} units<extra></extra>"
+    )
+    # shape="spline" softens the line's corners for rendering only (still
+    # passes through every real data point, just no longer sharp-angled) -
+    # `smooth` above is a separate, data-level rolling mean.
     fig = go.Figure(
         go.Scatter(
+            x=x,
             y=y,
             mode="lines",
-            line=dict(color=color, width=2.4, shape="spline" if smooth else "linear"),
-            hoverinfo="skip",
+            line=dict(color=color, width=2.4, shape="spline", smoothing=0.6),
+            hovertemplate=hovertemplate,
         )
     )
+    y_min, y_max = float(np.min(y)), float(np.max(y))
+    label_style = dict(showarrow=False, xref="paper", yref="y", xanchor="right",
+                        xshift=-4, font=dict(size=10, color="#94a3b8"))
+    fig.add_annotation(x=0, y=y_max, text=f"{y_max:.0f}", yanchor="top", **label_style)
+    fig.add_annotation(x=0, y=y_min, text=f"{y_min:.0f}", yanchor="bottom", **label_style)
     fig.update_layout(
         height=height,
-        margin=dict(l=4, r=4, t=6, b=4),
+        margin=dict(l=28, r=4, t=6, b=4),
         xaxis=dict(visible=False, fixedrange=True),
         yaxis=dict(visible=False, fixedrange=True),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
         autosize=True,
+        hoverlabel=dict(font_size=11),
     )
     return fig
 
@@ -620,12 +779,14 @@ def volatility_style(series) -> tuple[str, str]:
     return "#64748b", "Steady"
 
 
-def show_sparkline(values, color: str, key: str, *, smooth: bool = False, height: int = 96):
+def show_sparkline(values, color: str, key: str, *, smooth: bool = False, height: int = 96, dates=None):
+    # staticPlot=True previously blocked hover entirely regardless of the
+    # figure's own hover settings - dropped so the tooltip actually works.
     st.plotly_chart(
-        sparkline_fig(values, color, smooth=smooth, height=height),
+        sparkline_fig(values, color, smooth=smooth, height=height, dates=dates),
         width="stretch",
         theme=None,
-        config={"displayModeBar": False, "staticPlot": True},
+        config={"displayModeBar": False},
         key=key,
     )
 
@@ -633,6 +794,38 @@ def show_sparkline(values, color: str, key: str, *, smooth: bool = False, height
 model_inputs = load_model_inputs()
 policies_precomputed = load_layer_a_policies()
 pooling_precomputed = load_layer_b_pooling()
+
+with st.sidebar:
+    st.markdown("### Inventory Control")
+    _, max_d = sales_date_bounds()
+    st.caption(
+        f"Data as of **{_fmt_batch_date(max_d)}** — latest date in this historical "
+        "dataset (a frozen Kaggle export, not a live feed)."
+        if max_d is not None else "Data as of —"
+    )
+
+    st.markdown("##### Data sources")
+    for label, ok in [
+        ("Demand history (train.csv)", load_daily_sales() is not None),
+        ("Layer A policies", policies_precomputed is not None),
+        ("Layer B pooling results", pooling_precomputed is not None),
+        ("Logistics / GPS dataset", LOGISTICS_PATH.exists()),
+    ]:
+        mark = (
+            '<span style="color:#0f766e;font-weight:700;">✓</span>' if ok
+            else '<span style="color:#dc2626;font-weight:700;">✗</span>'
+        )
+        render_html(f'<div style="font-size:13px;color:#475569;margin:2px 0;">{mark} {label}</div>')
+
+    with st.expander("Quick guide"):
+        st.markdown(
+            "**Replenishment Strategy** — pick a store + SKU to see its (s, S) reorder "
+            "policy and current stock gauge.\n\n"
+            "**Risk Pooling** — compare safety stock held per-store vs. pooled centrally "
+            "per SKU, plus a what-if service-level slider.\n\n"
+            "**Dispatch Routes** — today's delivery routes for stores below reorder "
+            "point, solved as a capacitated VRP with ETAs."
+        )
 
 st.title("Inventory Control")
 st.caption("10 stores × 50 SKUs · (s, S) replenishment, risk pooling, and capacitated dispatch")
@@ -668,7 +861,9 @@ dash1.metric(
 dash2.metric(
     "Total Pooled Savings (%)",
     "—" if snap["pooled_pct"] is None else f"{snap['pooled_pct']:.1f}%",
-    help="Mean percent reduction in safety stock from pooling at the DC versus holding a buffer at every store, averaged across all SKUs in layer_b_pooling_results.csv.",
+    delta=None if snap["pooled_dollars"] is None else f"${snap['pooled_dollars']:,.0f}/yr",
+    delta_color="off",
+    help="Mean percent reduction in safety stock from pooling at the DC versus holding a buffer at every store, averaged across all SKUs. Dollar figure is the annual holding-cost saved across all 50 SKUs (units of safety stock saved x unit_cost_placeholder x holding_cost_rate_annual) - directionally right, not a real per-unit cost.",
 )
 if snap["route_cost"] is None:
     dash3.metric(
@@ -679,7 +874,7 @@ if snap["route_cost"] is None:
 else:
     dash3.metric(
         "Total Routing Cost/Distance",
-        f"{snap['route_cost']:,.0f}",
+        f"${snap['route_cost']:,.0f}",
         delta=f"{snap['route_km']:.0f} km",
         delta_color="off",
         help="Today's capacitated VRP: transport cost ($1.50/km + $50 per used truck) shown as the value; haversine kilometers on real logistics GPS shown underneath.",
@@ -778,7 +973,7 @@ with tab1:
             with col_tank:
                 tank_html = f"""
                 <div style="display:flex; justify-content:center; align-items:flex-end; gap:10px;">
-                  <div style="position:relative; height:220px; width:58px; font-size:11px; color:#64748b; text-align:right;">
+                  <div style="position:relative; height:220px; width:58px; font-size:11px; color:#475569; font-weight:600; text-align:right;">
                     <div style="position:absolute; top:0; right:0;">S {S_val}</div>
                     <div style="position:absolute; bottom:{s_pct:.2f}%; right:0; transform:translateY(50%);">ROP {s_plot}</div>
                     <div style="position:absolute; bottom:0; right:0;">0</div>
@@ -834,7 +1029,6 @@ with tab1:
                     render_html(
                         f'<div class="ops-note">Below ROP. Raise {need} units to order-up-to {S_val}.</div>'
                     )
-                    st.button("Create replenishment", type="primary", key="order_now")
                 elif on_hand <= s_plot and inventory_position >= s_plot:
                     render_html(
                         f'<div class="ops-note">Open PO covers the gap. Inventory position '
@@ -843,6 +1037,31 @@ with tab1:
                     )
                 else:
                     render_html('<div class="ops-note">Above ROP. No replenishment.</div>')
+
+            po_df = build_store_po(store, model_inputs, policies_precomputed)
+            if not po_df.empty:
+                st.markdown("")
+                st.download_button(
+                    f"Download Purchase Order — Store {store} ({len(po_df)} SKUs)",
+                    data=po_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"po_store_{store}.csv",
+                    mime="text/csv",
+                    type="primary",
+                    key="po_download",
+                    help="Every SKU at this store below reorder point with no PO already in transit.",
+                )
+
+            demand_hist = load_recent_demand_by_store(item, n_days=30)
+            if demand_hist is not None and store in demand_hist.columns:
+                st.markdown("")
+                st.markdown("##### Recent demand — this store & SKU (last 30 days)")
+                hist_series = demand_hist[store]
+                hist_color, hist_label = volatility_style(hist_series)
+                st.caption(f"{hist_label} demand — context for why the policy above landed where it did.")
+                show_sparkline(
+                    hist_series.to_numpy(), hist_color, key="spark_tab1_demand",
+                    smooth=False, height=120, dates=hist_series.index,
+                )
 
 
 # ===========================================================================
@@ -863,7 +1082,7 @@ with tab2:
         )
 
         item_row = pooling_precomputed[pooling_precomputed["item"] == item_for_network].iloc[0]
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.metric(
                 "Store-level safety stock",
@@ -878,6 +1097,43 @@ with tab2:
                 delta_color="inverse",
                 help="Safety stock if demand is pooled at the DC: z × √(Σᵢ Σⱼ σᵢ σⱼ ρᵢⱼ) × √L. Delta is (ss_decentralized − ss_pooled) / ss_decentralized.",
             )
+        with col3:
+            if model_inputs is not None and len(model_inputs):
+                unit_cost = float(model_inputs["unit_cost_placeholder"].iloc[0])
+                holding_rate = float(model_inputs["holding_cost_rate_annual"].iloc[0])
+                dollar_saved = (item_row["ss_decentralized"] - item_row["ss_pooled"]) * unit_cost * holding_rate
+                st.metric(
+                    "Est. annual $ saved",
+                    f"${dollar_saved:,.0f}",
+                    help="(Store-level − Pooled) safety stock x unit_cost_placeholder x holding_cost_rate_annual for this SKU. Placeholder unit cost, so directionally right, not a real dollar figure.",
+                )
+
+        with st.container(border=True):
+            st.markdown("##### What-if: target service level")
+            st.caption(
+                "Recomputes this SKU's safety stock at a different service level with Layer B's own "
+                "closed-form formula (z from the service level, same σ and cross-store correlation as above). "
+                "Layer A's (s, S) policy on Tab 1 is cost-based, not parameterized by a fill-rate target, "
+                "so it does not move with this slider."
+            )
+            service_level_pct = st.slider(
+                "Target service level", min_value=80.0, max_value=99.9, value=95.0,
+                step=0.5, format="%.1f%%", key="t2_service_level",
+            )
+            service_level = service_level_pct / 100.0
+            static_inputs = load_pooling_static_inputs(item_for_network)
+            if static_inputs is not None:
+                sigmas, lead_time, corr_matrix = static_inputs
+                z = float(norm.ppf(service_level))
+                ss_dec_wi = decentralized_safety_stock(sigmas, z, lead_time)
+                ss_pool_wi = pooled_safety_stock(sigmas, corr_matrix, z, lead_time)
+                wi1, wi2 = st.columns(2)
+                wi1.metric("Store-level safety stock (what-if)", f"{ss_dec_wi:.0f}")
+                wi_pct = 100 * (ss_dec_wi - ss_pool_wi) / ss_dec_wi if ss_dec_wi else 0.0
+                wi2.metric(
+                    "Pooled at DC (what-if)", f"{ss_pool_wi:.0f}",
+                    delta=f"-{wi_pct:.1f}%", delta_color="inverse",
+                )
 
         demand_by_store = load_recent_demand_by_store(item_for_network)
         stores = (
@@ -932,7 +1188,8 @@ with tab2:
                 st.markdown("**Central Warehouse**")
                 st.caption("Pooled demand — smoothed")
             if hub_values is not None:
-                show_sparkline(hub_values, "#1e3a5f", key="spark_hub", smooth=True, height=160)
+                show_sparkline(hub_values, "#1e3a5f", key="spark_hub", smooth=True, height=160,
+                               dates=demand_by_store.index)
 
         def render_store_card(s_id: int) -> None:
             color, label = "#64748b", "No data"
@@ -955,6 +1212,7 @@ with tab2:
                         key=f"spark_store_{int(s_id)}",
                         smooth=False,
                         height=100,
+                        dates=series.index,
                     )
 
         for chunk_start in range(0, len(stores), 5):
@@ -1082,6 +1340,13 @@ with tab3:
                         result = cached_vrp(
                             requests, store_geo, depot, fleet, 5
                         )
+                    if result is None:
+                        st.error(
+                            "Could not build a dispatch route for this batch — the routing "
+                            "solver hit an unexpected error. Try a different batch, or check "
+                            "the logs for details."
+                        )
+                        st.stop()
 
                     m3.metric(
                         "Total distance",
@@ -1090,7 +1355,7 @@ with tab3:
                     )
                     m4.metric(
                         "Transport cost",
-                        f"{result['total_cost']:,.0f}",
+                        f"${result['total_cost']:,.0f}",
                         help="Capacitated VRP (OR-Tools, PATH_CHEAPEST_ARC): $1.50/km + $50 per used truck. Feedback signal for Layer A’s K.",
                     )
                     st.caption(
@@ -1099,6 +1364,11 @@ with tab3:
                     )
 
                     st.markdown("#### Stop sequence")
+                    st.caption(
+                        f"ETA assumes trucks depart the depot at {DEPOT_DEPARTURE_HOUR}:00, "
+                        f"{AVG_TRUCK_SPEED_KMH:.0f} km/h average, {STOP_SERVICE_MINUTES:.0f} min at each stop "
+                        "to unload — no timing data exists in either source dataset, so treat as an estimate."
+                    )
                     for route in result["routes"]:
                         with st.container(border=True):
                             st.markdown(
@@ -1108,6 +1378,16 @@ with tab3:
                             render_html(stop_timeline_html(
                                 route, store_geo, depot_name, result["stops"]
                             ))
+
+                    st.download_button(
+                        "Download Driver Route Sheet (CSV)",
+                        data=build_driver_manifest(result["stops"], store_geo).to_csv(index=False).encode("utf-8"),
+                        file_name=f"driver_routes_{today.strftime('%Y-%m-%d')}.csv",
+                        mime="text/csv",
+                        type="primary",
+                        key="driver_manifest_download",
+                        help="Every truck's stop order with location and units to drop off - one sheet per dispatch.",
+                    )
 
                     st.markdown("#### Route map")
                     st.caption("Scroll to zoom · drag to pan · hover a pin for location and drop-off quantity.")

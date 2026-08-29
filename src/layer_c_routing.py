@@ -31,6 +31,13 @@ KG_PER_UNIT = 10.0
 COST_PER_KM = 1.50
 FIXED_COST_PER_ROUTE = 50.0
 
+# ETA assumptions - no speed/timing data exists anywhere in either source
+# dataset (train.csv is daily sales, the logistics file has no trip-leg
+# timestamps), so these are documented estimates, not measured figures.
+AVG_TRUCK_SPEED_KMH = 40.0  # conservative mixed highway/city average, loaded truck
+STOP_SERVICE_MINUTES = 20.0  # park, unload, get a signature
+DEPOT_DEPARTURE_HOUR = 8  # trucks roll out at 08:00 local time
+
 
 def haversine_distance_km(lat1, lon1, lat2, lon2) -> float:
     """Great-circle distance between two lat/lon points, in kilometers."""
@@ -135,29 +142,36 @@ def _extract_routes(manager, routing, solution, labels, demands_kg, capacities_k
         load_kg = 0
         dist_m = 0
         seq = 0
+        elapsed_service_min = 0.0
         while not routing.IsEnd(index):
             node = manager.IndexToNode(index)
             path_labels.append(labels[node])
             load_kg += demands_kg[node]
+            travel_min = (dist_m / 1000.0) / AVG_TRUCK_SPEED_KMH * 60.0
             stop_rows.append({
                 "vehicle": vehicle_id,
                 "seq": seq,
                 "stop": labels[node],
                 "demand_kg": demands_kg[node],
                 "cumul_load_kg": load_kg,
+                "eta_minutes": round(travel_min + elapsed_service_min, 1),
             })
+            if node != 0:  # depot is always node 0 - no service time to add for it
+                elapsed_service_min += STOP_SERVICE_MINUTES
             previous_index = index
             index = solution.Value(routing.NextVar(index))
             dist_m += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
             seq += 1
         end_node = manager.IndexToNode(index)
         path_labels.append(labels[end_node])
+        travel_min = (dist_m / 1000.0) / AVG_TRUCK_SPEED_KMH * 60.0
         stop_rows.append({
             "vehicle": vehicle_id,
             "seq": seq,
             "stop": labels[end_node],
             "demand_kg": 0,
             "cumul_load_kg": load_kg,
+            "eta_minutes": round(travel_min + elapsed_service_min, 1),
         })
         dist_km = dist_m / 1000.0
         routes.append({
