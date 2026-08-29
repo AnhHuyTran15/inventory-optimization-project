@@ -25,6 +25,7 @@ import streamlit as st
 from scipy.stats import norm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+from src.demand_forecast import forecast_demand  # noqa: E402
 from src.layer_a_dp import solve_for_row  # noqa: E402
 from src.layer_b_pooling import (  # noqa: E402
     compute_correlation_matrix,
@@ -725,9 +726,15 @@ def build_store_po(store: int, model_inputs_df: pd.DataFrame, policies_df: pd.Da
     ])
 
 
-def sparkline_fig(values, color: str, *, smooth: bool = False, height: int = 96, dates=None):
+def sparkline_fig(values, color: str, *, smooth: bool = False, height: int = 96, dates=None,
+                   forecast: pd.Series | None = None):
     """Compact demand sparkline that fills the card; axes hidden but hover +
-    min/max end-labels give a reader the actual numbers behind the shape."""
+    min/max end-labels give a reader the actual numbers behind the shape.
+
+    `forecast`, if given, is a dated Series continuing past `dates`' last
+    point - drawn as a dashed continuation of the same line, not a new color,
+    so it reads as "this line, projected" rather than a second series.
+    """
     y = np.asarray(values, dtype=float)
     if smooth and len(y) >= 5:
         y = pd.Series(y).rolling(5, min_periods=1, center=True).mean().to_numpy()
@@ -747,9 +754,24 @@ def sparkline_fig(values, color: str, *, smooth: bool = False, height: int = 96,
             mode="lines",
             line=dict(color=color, width=2.4, shape="spline", smoothing=0.6),
             hovertemplate=hovertemplate,
+            name="actual",
         )
     )
-    y_min, y_max = float(np.min(y)), float(np.max(y))
+    all_y = [y]
+    if forecast is not None and len(forecast) and dates is not None:
+        fx = pd.to_datetime([x[-1]] + list(forecast.index))
+        fy = np.clip(np.asarray([y[-1]] + list(forecast.to_numpy(dtype=float))), 0, None)
+        fig.add_trace(go.Scatter(
+            x=fx,
+            y=fy,
+            mode="lines",
+            line=dict(color=color, width=2.0, dash="dash", shape="spline", smoothing=0.6),
+            opacity=0.6,
+            hovertemplate="%{x|%b %d}: %{y:.0f} units (forecast)<extra></extra>",
+            name="forecast",
+        ))
+        all_y.append(fy)
+    y_min, y_max = float(np.min(np.concatenate(all_y))), float(np.max(np.concatenate(all_y)))
     label_style = dict(showarrow=False, xref="paper", yref="y", xanchor="right",
                         xshift=-4, font=dict(size=10, color="#94a3b8"))
     fig.add_annotation(x=0, y=y_max, text=f"{y_max:.0f}", yanchor="top", **label_style)
@@ -779,11 +801,12 @@ def volatility_style(series) -> tuple[str, str]:
     return "#64748b", "Steady"
 
 
-def show_sparkline(values, color: str, key: str, *, smooth: bool = False, height: int = 96, dates=None):
+def show_sparkline(values, color: str, key: str, *, smooth: bool = False, height: int = 96, dates=None,
+                    forecast: pd.Series | None = None):
     # staticPlot=True previously blocked hover entirely regardless of the
     # figure's own hover settings - dropped so the tooltip actually works.
     st.plotly_chart(
-        sparkline_fig(values, color, smooth=smooth, height=height, dates=dates),
+        sparkline_fig(values, color, smooth=smooth, height=height, dates=dates, forecast=forecast),
         width="stretch",
         theme=None,
         config={"displayModeBar": False},
@@ -942,11 +965,42 @@ with tab1:
             )
             inventory_position = on_hand + in_transit
 
+            # Dynamic ROP: a simple heuristic overlay on Layer A's static (s, S) -
+            # not a re-solve of the Bellman equation. If a short-horizon forecast
+            # (src/demand_forecast.py) says demand over the lead time will run
+            # hotter than the historical mean the DP assumed, temporarily raise
+            # the trigger threshold by that excess so a forecasted spike shows up
+            # before on-hand actually crashes through the static s.
+            lead_time_days = max(float(row["lead_time_mean_days"]), 1.0)
+            horizon = max(int(round(lead_time_days)), 1)
+            demand_hist = load_recent_demand_by_store(item, n_days=30)
+            hist_series = (
+                demand_hist[store] if demand_hist is not None and store in demand_hist.columns else None
+            )
+            s_effective = s_plot
+            dynamic_note = None
+            demand_forecast = pd.Series(dtype=float)
+            if hist_series is not None:
+                demand_forecast = forecast_demand(hist_series, horizon=horizon)
+                fc = demand_forecast
+                if len(fc):
+                    forecast_total = float(fc.sum())
+                    baseline_total = float(row["demand_mean"]) * horizon
+                    excess = forecast_total - baseline_total
+                    if excess > 0:
+                        s_effective = min(s_plot + int(round(excess)), S_val - 1)
+                        dynamic_note = (
+                            f"Demand forecast over the next {horizon}-day lead time is "
+                            f"{forecast_total:.0f} units, {excess:.0f} above the "
+                            f"{baseline_total:.0f}-unit baseline the static policy assumed — "
+                            f"reorder point raised from {s_plot} to {s_effective} until the forecast eases."
+                        )
+
             on_hand_pct = (on_hand / S_val) * 100
             transit_pct = (in_transit / S_val) * 100
-            s_pct = (s_plot / S_val) * 100
+            s_pct = (s_effective / S_val) * 100
 
-            if on_hand > s_plot:
+            if on_hand > s_effective:
                 badge_class, badge_text = "status-ok", f"Current Stock: {on_hand} units - Healthy"
             elif in_transit > 0:
                 badge_class, badge_text = (
@@ -975,7 +1029,7 @@ with tab1:
                 <div style="display:flex; justify-content:center; align-items:flex-end; gap:10px;">
                   <div style="position:relative; height:220px; width:58px; font-size:11px; color:#475569; font-weight:600; text-align:right;">
                     <div style="position:absolute; top:0; right:0;">S {S_val}</div>
-                    <div style="position:absolute; bottom:{s_pct:.2f}%; right:0; transform:translateY(50%);">ROP {s_plot}</div>
+                    <div style="position:absolute; bottom:{s_pct:.2f}%; right:0; transform:translateY(50%);">ROP {s_effective}</div>
                     <div style="position:absolute; bottom:0; right:0;">0</div>
                   </div>
                   <div style="position:relative; width:88px; height:220px;
@@ -1010,8 +1064,12 @@ with tab1:
                 m1, m2, m3 = st.columns(3)
                 m1.metric(
                     "Reorder Point",
-                    f"{s_plot}",
-                    help="s in the (s, S) policy. When on-hand falls to this level or below, a replenishment is triggered. Solved by value iteration on the Bellman equation.",
+                    f"{s_effective}",
+                    delta=f"+{s_effective - s_plot} forecast" if s_effective > s_plot else None,
+                    delta_color="inverse",
+                    help="Static s from Layer A's Bellman value iteration, dynamically raised when a "
+                         "short-horizon demand forecast exceeds the historical mean the DP assumed "
+                         "(see the note below the metrics).",
                 )
                 m2.metric(
                     "Order-up-to Level",
@@ -1024,12 +1082,17 @@ with tab1:
                     help="Units already on an open purchase order. Added to on-hand to form inventory position so this screen does not raise a second order.",
                 )
 
-                if on_hand <= s_plot and in_transit == 0:
+                if dynamic_note:
+                    render_html(
+                        f'<div class="ops-note" style="border-left:3px solid #d97706;">{dynamic_note}</div>'
+                    )
+
+                if on_hand <= s_effective and in_transit == 0:
                     need = S_val - on_hand
                     render_html(
                         f'<div class="ops-note">Below ROP. Raise {need} units to order-up-to {S_val}.</div>'
                     )
-                elif on_hand <= s_plot and inventory_position >= s_plot:
+                elif on_hand <= s_effective and inventory_position >= s_effective:
                     render_html(
                         f'<div class="ops-note">Open PO covers the gap. Inventory position '
                         f"{inventory_position} (on-hand {on_hand} + in-transit {in_transit}). "
@@ -1051,16 +1114,18 @@ with tab1:
                     help="Every SKU at this store below reorder point with no PO already in transit.",
                 )
 
-            demand_hist = load_recent_demand_by_store(item, n_days=30)
-            if demand_hist is not None and store in demand_hist.columns:
+            if hist_series is not None:
                 st.markdown("")
                 st.markdown("##### Recent demand — this store & SKU (last 30 days)")
-                hist_series = demand_hist[store]
                 hist_color, hist_label = volatility_style(hist_series)
-                st.caption(f"{hist_label} demand — context for why the policy above landed where it did.")
+                forecast_suffix = (
+                    f" · dashed tail is the {horizon}-day forecast driving the reorder point above"
+                    if len(demand_forecast) else ""
+                )
+                st.caption(f"{hist_label} demand — context for why the policy above landed where it did.{forecast_suffix}")
                 show_sparkline(
                     hist_series.to_numpy(), hist_color, key="spark_tab1_demand",
-                    smooth=False, height=120, dates=hist_series.index,
+                    smooth=False, height=120, dates=hist_series.index, forecast=demand_forecast,
                 )
 
 
@@ -1155,8 +1220,11 @@ with tab2:
         )
 
         hub_values = None
+        hub_forecast = None
         if demand_by_store is not None:
-            hub_values = demand_by_store.mean(axis=1).to_numpy()
+            hub_series = demand_by_store.mean(axis=1)
+            hub_values = hub_series.to_numpy()
+            hub_forecast = forecast_demand(hub_series, horizon=7)
 
         store_nodes = "".join(
             f'<div class="net-store-node"><div class="net-store-stem"></div>'
@@ -1186,10 +1254,10 @@ with tab2:
                 render_html(WAREHOUSE_ICON)
             with title_col:
                 st.markdown("**Central Warehouse**")
-                st.caption("Pooled demand — smoothed")
+                st.caption("Pooled demand — smoothed · dashed tail is a 7-day forecast (Holt-Winters)")
             if hub_values is not None:
                 show_sparkline(hub_values, "#1e3a5f", key="spark_hub", smooth=True, height=160,
-                               dates=demand_by_store.index)
+                               dates=demand_by_store.index, forecast=hub_forecast)
 
         def render_store_card(s_id: int) -> None:
             color, label = "#64748b", "No data"
@@ -1312,7 +1380,7 @@ with tab3:
                         """
                     )
 
-                m1, m2, m3, m4 = st.columns(4)
+                m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric(
                     "Stores to deliver",
                     f"{n_stores}",
@@ -1334,6 +1402,11 @@ with tab3:
                         "Transport cost",
                         "—",
                         help="Capacitated VRP cost ($1.50/km + $50 per used truck) once a route is solved. Empty when this batch has no requests.",
+                    )
+                    m5.metric(
+                        "CO2 emissions",
+                        "—",
+                        help="Estimated at 0.10 kg CO2 per tonne-km carried, once a route is solved. Empty when this batch has no requests.",
                     )
                 else:
                     with st.spinner("Building dispatch routes…"):
@@ -1358,6 +1431,12 @@ with tab3:
                         f"${result['total_cost']:,.0f}",
                         help="Capacitated VRP (OR-Tools, PATH_CHEAPEST_ARC): $1.50/km + $50 per used truck. Feedback signal for Layer A’s K.",
                     )
+                    m5.metric(
+                        "CO2 emissions",
+                        f"{result['total_co2_kg']:,.0f} kg",
+                        help="0.10 kg CO2 per tonne-km carried (documented estimate — no fuel data in either "
+                             "source dataset), applied to each route's actual load and distance.",
+                    )
                     st.caption(
                         f"Today in this dataset is **{today_label}** (latest sales date). "
                         f"Depot: {depot_name} ({depot[0]:.4f}, {depot[1]:.4f})."
@@ -1373,7 +1452,8 @@ with tab3:
                         with st.container(border=True):
                             st.markdown(
                                 f"**Truck {route['vehicle']}** · {route['distance_km']} km · "
-                                f"{route['load_kg']/1000:.1f} / {route['capacity_kg']/1000:.1f} t loaded"
+                                f"{route['load_kg']/1000:.1f} / {route['capacity_kg']/1000:.1f} t loaded · "
+                                f"{route['co2_kg']:.0f} kg CO2"
                             )
                             render_html(stop_timeline_html(
                                 route, store_geo, depot_name, result["stops"]

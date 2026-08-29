@@ -38,6 +38,13 @@ AVG_TRUCK_SPEED_KMH = 40.0  # conservative mixed highway/city average, loaded tr
 STOP_SERVICE_MINUTES = 20.0  # park, unload, get a signature
 DEPOT_DEPARTURE_HOUR = 8  # trucks roll out at 08:00 local time
 
+# Diesel heavy-truck emission factor, kg CO2 per tonne-km - mid-range of
+# published figures (roughly 0.06-0.15 depending on vehicle class and load
+# factor). No fuel-consumption data exists in either source dataset, so this
+# is a documented estimate applied to each route's actual carried load, not
+# a measured figure.
+CO2_KG_PER_TONNE_KM = 0.10
+
 
 def haversine_distance_km(lat1, lon1, lat2, lon2) -> float:
     """Great-circle distance between two lat/lon points, in kilometers."""
@@ -182,6 +189,7 @@ def _extract_routes(manager, routing, solution, labels, demands_kg, capacities_k
             "load_kg": load_kg,
             "distance_km": round(dist_km, 2),
             "cost": round(FIXED_COST_PER_ROUTE + COST_PER_KM * dist_km, 2),
+            "co2_kg": round(dist_km * (load_kg / 1000.0) * CO2_KG_PER_TONNE_KM, 1),
         })
     return routes, pd.DataFrame(stop_rows)
 
@@ -220,6 +228,7 @@ def build_vrp_model(delivery_requests: pd.DataFrame,
             "stops": pd.DataFrame(),
             "total_distance_km": 0.0,
             "total_cost": 0.0,
+            "total_co2_kg": 0.0,
             "n_vehicles_used": 0,
         }
 
@@ -294,6 +303,7 @@ def build_vrp_model(delivery_requests: pd.DataFrame,
             "stops": pd.DataFrame(),
             "total_distance_km": 0.0,
             "total_cost": 0.0,
+            "total_co2_kg": 0.0,
             "n_vehicles_used": 0,
         }
 
@@ -302,12 +312,14 @@ def build_vrp_model(delivery_requests: pd.DataFrame,
     )
     total_km = float(sum(r["distance_km"] for r in routes))
     total_cost = float(sum(r["cost"] for r in routes))
+    total_co2 = float(sum(r["co2_kg"] for r in routes))
     result = {
         "status": "SOLVED",
         "routes": routes,
         "stops": stops_df,
         "total_distance_km": round(total_km, 2),
         "total_cost": round(total_cost, 2),
+        "total_co2_kg": round(total_co2, 1),
         "n_vehicles_used": len(routes),
         "cost_per_km": COST_PER_KM,
         "fixed_cost_per_route": FIXED_COST_PER_ROUTE,

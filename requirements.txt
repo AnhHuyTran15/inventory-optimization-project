@@ -14,6 +14,9 @@ ipykernel>=6.25
 # Layer C routing (optional, only needed once you implement the VRP solver)
 ortools>=9.7
 
+# Demand forecast (Holt-Winters, Tab 2) - fits live per SKU, no precompute needed
+statsmodels>=0.14
+
 # App + deploy
 streamlit>=1.28
 matplotlib>=3.7
