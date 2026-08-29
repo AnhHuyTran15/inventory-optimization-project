@@ -122,9 +122,18 @@ st.markdown(
       }
       div[data-testid="stMetric"] {
         background: var(--paper); border-radius: var(--radius); box-shadow: var(--shadow);
-        padding: var(--space-3) var(--space-4);
+        padding: var(--space-3) 10px;
       }
-      div[data-testid="stMetric"] label { font-size: 13px !important; color: var(--muted) !important; }
+      /* Narrow columns (5-up rows on Tab 3) otherwise truncate the label
+         and/or value with an ellipsis - wrap the label instead, and let the
+         value shrink to fit rather than clip. */
+      div[data-testid="stMetric"] label {
+        font-size: 13px !important; color: var(--muted) !important;
+        white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
+      }
+      div[data-testid="stMetricValue"] {
+        overflow: visible !important; text-overflow: clip !important; white-space: nowrap !important;
+      }
       /* delta ("↑ 13787 km") defaults to a very light gray with delta_color="off" - too faint */
       div[data-testid="stMetricDelta"] { color: #334155 !important; }
       div[data-testid="stMetricDelta"] svg { fill: #334155 !important; }
@@ -528,6 +537,13 @@ def _store_id_from_stop(label: str) -> int | None:
 
 def _fmt_batch_date(d) -> str:
     return pd.Timestamp(d).strftime("%b %d, %Y")
+
+
+def format_k(value: float, decimals: int = 1) -> str:
+    """Compact thousands formatting for tight metric cards: 21130 -> '21.1k'."""
+    if abs(value) >= 1000:
+        return f"{value / 1000:.{decimals}f}k"
+    return f"{value:.0f}"
 
 
 def _format_eta(minutes_from_depart: float) -> str:
@@ -1482,29 +1498,29 @@ with tab3:
 
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric(
-                    "Stores to deliver",
+                    "Stores",
                     f"{n_stores}",
                     help="Stores with at least one SKU at or below reorder point s for the selected batch.",
                 )
                 m2.metric(
-                    "SKUs below ROP",
+                    "SKUs",
                     f"{len(requests)}",
                     help="Store–SKU pairs whose walked on-hand is ≤ reorder point s. Order quantity = S − on-hand.",
                 )
 
                 if requests.empty:
                     m3.metric(
-                        "Total distance",
+                        "Distance",
                         "—",
                         help="Haversine km on real logistics GPS once a route is solved. Empty when this batch has no requests.",
                     )
                     m4.metric(
-                        "Transport cost",
+                        "Cost",
                         "—",
                         help="Capacitated VRP cost ($1.50/km + $50 per used truck) once a route is solved. Empty when this batch has no requests.",
                     )
                     m5.metric(
-                        "CO2 emissions",
+                        "CO2",
                         "—",
                         help="Estimated at 0.10 kg CO2 per tonne-km carried, once a route is solved. Empty when this batch has no requests.",
                     )
@@ -1522,18 +1538,18 @@ with tab3:
                         st.stop()
 
                     m3.metric(
-                        "Total distance",
-                        f"{result['total_distance_km']:.0f} km",
+                        "Distance",
+                        f"{format_k(result['total_distance_km'])} km",
                         help="Haversine km on real logistics GPS (Destination Location, seed=42) — not Kaggle store addresses.",
                     )
                     m4.metric(
-                        "Transport cost",
-                        f"${result['total_cost']:,.0f}",
+                        "Cost",
+                        f"${format_k(result['total_cost'])}",
                         help="Capacitated VRP (OR-Tools, PATH_CHEAPEST_ARC): $1.50/km + $50 per used truck. Feedback signal for Layer A’s K.",
                     )
                     m5.metric(
-                        "CO2 emissions",
-                        f"{result['total_co2_kg']:,.0f} kg",
+                        "CO2",
+                        f"{format_k(result['total_co2_kg'])} kg",
                         help="0.10 kg CO2 per tonne-km carried (documented estimate — no fuel data in either "
                              "source dataset), applied to each route's actual load and distance.",
                     )
