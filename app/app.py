@@ -125,14 +125,31 @@ st.markdown(
         padding: var(--space-3) 10px;
       }
       /* Narrow columns (5-up rows on Tab 3) otherwise truncate the label
-         and/or value with an ellipsis - wrap the label instead, and let the
-         value shrink to fit rather than clip. */
-      div[data-testid="stMetric"] label {
+         and/or value with an ellipsis. Streamlit nests the actual text in
+         stMarkdownContainer > p *inside* the label/value element, and that
+         inner p carries its own overflow:hidden/ellipsis/nowrap - overriding
+         only the outer element (as a first pass here did) has no effect, so
+         every level needs the override. */
+      div[data-testid="stMetric"] label,
+      div[data-testid="stMetric"] label [data-testid="stMarkdownContainer"],
+      div[data-testid="stMetric"] label p {
         font-size: 13px !important; color: var(--muted) !important;
         white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
+        word-break: keep-all !important; overflow-wrap: normal !important;
       }
-      div[data-testid="stMetricValue"] {
+      /* Value stays on one line (word-break would otherwise split numbers
+         mid-digit, e.g. "$21,130" -> "$21,13" / "0"). overflow:visible alone
+         isn't enough insurance at 5-up column widths - a value that doesn't
+         fit spills into the next (opaque) card and gets visually cut off
+         there, which reads even worse than an ellipsis. Shrinking the value
+         font is what actually keeps it inside its own card at realistic
+         widths; overflow:visible just stops an ellipsis appearing if a wider
+         window is squeezed narrower than that. */
+      div[data-testid="stMetricValue"],
+      div[data-testid="stMetricValue"] [data-testid="stMarkdownContainer"],
+      div[data-testid="stMetricValue"] p {
         overflow: visible !important; text-overflow: clip !important; white-space: nowrap !important;
+        font-size: 1.5rem !important;
       }
       /* delta ("↑ 13787 km") defaults to a very light gray with delta_color="off" - too faint */
       div[data-testid="stMetricDelta"] { color: #334155 !important; }
